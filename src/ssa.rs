@@ -126,6 +126,10 @@ impl<Debug> Body<Debug> {
         let mut def: HashMap<VariableId, HashMap<BlockId, ValueId>> = HashMap::new();
 
         for (i, bb) in self.blocks.iter().enumerate() {
+            for b in 0..self.blocks.len() {
+                if self.is_dominance(BlockId(i), BlockId(b)) { println!("{i} {b}"); }
+            }
+
             for inst in bb.instructions.iter() {
                 match inst.operation {
                     Operation::Store(var, val) => if let Some(w) = def.get_mut(&var) {
@@ -141,19 +145,21 @@ impl<Debug> Body<Debug> {
         }
 
         let mut w = def.clone();
-        println!("{w:?}");
 
         let mut f = HashSet::new();
 
         for (v, w) in w.iter_mut() {
+            if v.0 != 0 { continue; }
             while let Some((bbi, val)) = w.iter().next() {
+                println!("{bbi} {f:?} {w:?}");
+
                 let bbi = *bbi;
                 let val = *val;
 
                 w.remove(&bbi);
 
-                println!("{bbi} {:?}", self.df(bbi));
                 for y in self.df(bbi) {
+                    println!("{bbi} {y}");
                     if !f.contains(&y) {
                         let phi = alloc.allocate_value();
 
@@ -175,15 +181,8 @@ impl<Debug> Body<Debug> {
         let mut df = Vec::new();
 
         for (wi, _) in self.blocks.iter().enumerate() {
-            if !self.is_strict_dom(x, BlockId(wi)) {
-                continue;
-            }
-
-            for pred in self.predecessors(BlockId(wi)) {
-                if self.is_dominance(x, pred) {
-                    df.push(BlockId(wi));
-                    break;
-                }
+            if !self.is_strict_dom(x, BlockId(wi)) && self.predecessors(BlockId(wi)).iter().filter(|pred| self.is_dominance(x, **pred)).count() == 0 {
+                df.push(BlockId(wi));
             }
         }
 
@@ -191,25 +190,27 @@ impl<Debug> Body<Debug> {
     }
 
     fn is_dominance(&self, f: BlockId, t: BlockId) -> bool {
-        let mut visited = Vec::new();
-        self._is_dominance(f, t, &mut visited)
+        let mut visited = HashSet::new();
+        self._is_dominance(BlockId(0), f, t, &mut visited, false)
     }
 
-    fn _is_dominance(&self, f: BlockId, t: BlockId, visited: &mut Vec<BlockId>) -> bool {
-        if f == t {
+    fn _is_dominance(&self, at: BlockId, f: BlockId, t: BlockId, visited: &mut HashSet<BlockId>, ok: bool) -> bool {
+        if at == t {
             return true;
-        } else if visited.contains(&f) {
+        } else if visited.contains(&at) {
             return false;
         }
 
-        visited.push(f);
+        let ok = ok || at == f;
 
-        if match self.blocks[*f].terminator {
-            Terminator::Jump(a) => self._is_dominance(a, t, visited),
-            Terminator::Branch(_, a, b) => self._is_dominance(a, t, visited) || self._is_dominance(b, t, visited),
+        visited.insert(at);
+
+        if match self.blocks[*at].terminator {
+            Terminator::Jump(a) => self._is_dominance(a, f, t, visited, ok),
+            Terminator::Branch(_, a, b) => self._is_dominance(a, f, t, visited, ok) && self._is_dominance(b, f, t, visited, ok),
             _ => false,
         } {
-            visited.iter().position(|a| *a == f).map(|i| visited.remove(i));
+            visited.remove(&at);
             true
         } else {
             false

@@ -13,7 +13,7 @@ fn main() {
     let xt = builder.allocate_value();
 
     builder.append_instruction(a, instruction!(Operation::Store(x, zero)));
-    builder.set_terminator(a, Terminator::Jump(b));
+    builder.set_terminator(a, Terminator::Branch(zero, a, b));
 
     builder.append_instruction(b, instruction!(Operation::Load(x) => xt));
     builder.set_terminator(b, Terminator::Return(Some(xt)));
