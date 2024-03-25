@@ -120,16 +120,16 @@ pub enum Terminator {
 impl<Debug> Body<Debug> {
     pub(crate) fn ssa_form(&mut self, alloc: &mut crate::builder::ResourceAllocator) {
         self.insert_phi(alloc);
+
+        for b in self.blocks.iter_mut() {
+            b.remove_load_store();
+        }
     }
 
     fn insert_phi(&mut self, alloc: &mut crate::builder::ResourceAllocator) {
         let mut def: HashMap<VariableId, HashMap<BlockId, ValueId>> = HashMap::new();
 
         for (i, bb) in self.blocks.iter().enumerate() {
-            for b in 0..self.blocks.len() {
-                if self.is_dominance(BlockId(i), BlockId(b)) { println!("{i} {b}"); }
-            }
-
             for inst in bb.instructions.iter() {
                 match inst.operation {
                     Operation::Store(var, val) => if let Some(w) = def.get_mut(&var) {
@@ -146,25 +146,35 @@ impl<Debug> Body<Debug> {
 
         let mut w = def.clone();
 
-        let mut f = HashSet::new();
+        let mut f = vec![HashSet::new(); self.blocks.len()];
 
         for (v, w) in w.iter_mut() {
-            if v.0 != 0 { continue; }
             while let Some((bbi, val)) = w.iter().next() {
-                println!("{bbi} {f:?} {w:?}");
-
                 let bbi = *bbi;
                 let val = *val;
 
                 w.remove(&bbi);
 
                 for y in self.df(bbi) {
-                    println!("{bbi} {y}");
-                    if !f.contains(&y) {
-                        let phi = alloc.allocate_value();
+                    if !f[*bbi].contains(&y) {
+                        let phi = if f.iter().position(|a| a.contains(&y)).is_none() {
+                            let phi = alloc.allocate_value();
 
-                        self.blocks[*y].instructions.insert(0, crate::instruction!(Operation::Phi(vec![(val, bbi)]) => phi));
-                        f.insert(y);
+                            self.blocks[*y].instructions.insert(0, crate::instruction!(Operation::Phi(vec![(val, bbi)]) => phi));
+                            self.blocks[*y].replace_variable(*v, phi);
+
+                            phi
+                        } else {
+                            match &mut self.blocks[*y].instructions[0] {
+                                Instruction { destination, operation: Operation::Phi(l) } => {
+                                    l.push((val, bbi));
+                                    destination.unwrap()
+                                },
+                                _ => unreachable!(),
+                            }
+                        };
+
+                        f[*bbi].insert(y);
 
                         if !def.get(v).unwrap().contains_key(&y) {
                             w.insert(y, phi);
@@ -173,7 +183,9 @@ impl<Debug> Body<Debug> {
                 }
             }
 
-            f.clear();
+            for f in f.iter_mut() {
+                f.clear();
+            }
         }
     }
 
@@ -181,7 +193,7 @@ impl<Debug> Body<Debug> {
         let mut df = Vec::new();
 
         for (wi, _) in self.blocks.iter().enumerate() {
-            if !self.is_strict_dom(x, BlockId(wi)) && self.predecessors(BlockId(wi)).iter().filter(|pred| self.is_dominance(x, **pred)).count() == 0 {
+            if !self.is_strict_dom(x, BlockId(wi)) && self.predecessors(BlockId(wi)).iter().filter(|pred| self.is_dominance(x, **pred)).count() != 0 {
                 df.push(BlockId(wi));
             }
         }
@@ -190,31 +202,47 @@ impl<Debug> Body<Debug> {
     }
 
     fn is_dominance(&self, f: BlockId, t: BlockId) -> bool {
-        let mut visited = HashSet::new();
-        self._is_dominance(BlockId(0), f, t, &mut visited, false)
-    }
-
-    fn _is_dominance(&self, at: BlockId, f: BlockId, t: BlockId, visited: &mut HashSet<BlockId>, ok: bool) -> bool {
-        if at == t {
+        if f == t {
             return true;
-        } else if visited.contains(&at) {
-            return false;
         }
 
+        let mut visited = HashSet::new();
+        self._is_dominance(BlockId(0), f, t, &mut visited, false) == 1
+    }
+
+    fn _is_dominance(&self, at: BlockId, f: BlockId, t: BlockId, visited: &mut HashSet<BlockId>, ok: bool) -> usize {
         let ok = ok || at == f;
+
+        if at == t {
+            return ok as usize;
+        } else if visited.contains(&at) {
+            return 2;
+        }
 
         visited.insert(at);
 
-        if match self.blocks[*at].terminator {
+        let ret = match self.blocks[*at].terminator {
             Terminator::Jump(a) => self._is_dominance(a, f, t, visited, ok),
-            Terminator::Branch(_, a, b) => self._is_dominance(a, f, t, visited, ok) && self._is_dominance(b, f, t, visited, ok),
-            _ => false,
-        } {
+            Terminator::Branch(_, a, b) => {
+                let a = self._is_dominance(a, f, t, visited, ok);
+                let b = self._is_dominance(b, f, t, visited, ok);
+
+                if a == 0 || b == 0 {
+                    0
+                } else if a == 2 && b == 2 {
+                    2
+                } else {
+                    1
+                }
+            },
+            _ => 2,
+        };
+
+        if ret == 1 {
             visited.remove(&at);
-            true
-        } else {
-            false
         }
+
+        ret
     }
 
     fn is_strict_dom(&self, f: BlockId, t: BlockId) -> bool {
@@ -227,6 +255,58 @@ impl<Debug> Body<Debug> {
             Terminator::Branch(_, a, b) => a == bbi || b == bbi,
             _ => false,
         }).map(|(i, _)| BlockId(i)).collect()
+    }
+}
+
+impl<Debug> Block<Debug> {
+    fn replace_variable(&mut self, var: VariableId, mut val: ValueId) {
+        let mut replace = HashMap::new();
+
+        for i in self.instructions.iter_mut() {
+            match i {
+                Instruction { destination: Some(d), operation: Operation::Load(lvar) } if *lvar == var => {
+                    replace.insert(*d, val);
+                },
+                Instruction { operation: Operation::Store(svar, sval), .. } if *svar == var => {
+                    val = *sval;
+                },
+                Instruction { operation: Operation::BinOp(_, a, b), .. } => {
+                    replace.get(&a).map(|n| *a = *n);
+                    replace.get(&b).map(|n| *b = *n);
+                },
+                Instruction { operation: Operation::Call(_, v), .. } => {
+                    for v in v.iter_mut() {
+                        replace.get(&v).map(|n| *v = *n);
+                    }
+                },
+                Instruction { operation: Operation::Integer(..) | Operation::Allocate(..) | Operation::Phi(..) | Operation::Load(..) | Operation::Store(..), .. } => {},
+            }
+        }
+
+        match &mut self.terminator {
+            Terminator::Branch(v, _, _) => {
+                replace.get(&v).map(|n| *v = *n);
+            },
+            Terminator::Return(v) => {
+                v.as_mut().and_then(|v| replace.get(&v).map(|n| *v = *n));
+            },
+            _ => {},
+        }
+    }
+
+    fn remove_load_store(&mut self) {
+        let mut remove = Vec::new();
+
+        for (i, e) in self.instructions.iter().enumerate() {
+            match e.operation {
+                Operation::Load(..) | Operation::Store(..) => remove.push(i),
+                _ => {},
+            }
+        }
+
+        for (i, e) in remove.into_iter().enumerate() {
+            self.instructions.remove(e - i);
+        }
     }
 }
 
@@ -257,7 +337,7 @@ impl<Debug: std::fmt::Debug> Display for Block<Debug> {
 impl Display for Terminator {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         match self {
-            Self::Return(Some(v))           => write!(fmt, "\x1b[32mret {v}"),
+            Self::Return(Some(v))           => write!(fmt, "\x1b[32mret \x1b[36m{v}"),
             Self::Return(None)              => write!(fmt, "\x1b[32mret"),
             Self::Jump(block)               => write!(fmt, "\x1b[32mjmp \x1b[35m{block}"),
             Self::Branch(cond, if_, else_)  => write!(fmt, "\x1b[32mbr \x1b[36m{cond} \x1b[35m{if_} {else_}"),
@@ -315,9 +395,12 @@ pub struct Ssa<Debug> {
 
 impl<Debug: std::fmt::Debug> Display for Ssa<Debug> {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
-        for f in self.functions.iter() {
+        for (i, f) in self.functions.iter().enumerate() {
             writeln!(fmt, "\x1b[1;4m{}:\x1b[0m", f.name)?;
-            writeln!(fmt, "{}", f.body)?;
+            write!(fmt, "{}", f.body)?;
+            if i != self.functions.len() - 1 {
+                writeln!(fmt)?;
+            }
         }
 
         Ok(())
